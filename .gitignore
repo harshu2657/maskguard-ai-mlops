@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+
+# PyCharm
+.idea/
+.vscode/
+
+# Environment / secrets
+.env
+
+# MLflow
+mlruns/
+mlflow.db
+mlflow.db-journal
+mlflow.db-shm
+mlflow.db-wal
+
+# Training outputs
+runs/
+
+# Dataset
+data/raw/
+data/processed/
+
+# Large model files
+*.pt
+*.pth
+
+# Logs
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
