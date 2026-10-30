@@ -1,3 +1,4 @@
+
 from pathlib import Path
 import os
 import tempfile
@@ -6,7 +7,7 @@ import mlflow
 from mlflow.tracking import MlflowClient
 from ultralytics import YOLO
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 
@@ -28,7 +29,7 @@ MODEL_ALIAS = "champion"
 
 app = FastAPI(
     title="Face Mask Detection API",
-    description="Real-time face mask detection API using YOLOv8 and MLflow.",
+    description="Face mask detection API using YOLOv8 and MLflow.",
     version="1.0.0",
 )
 
@@ -40,6 +41,18 @@ model = None
 # ============================================================
 
 def get_model_path_from_mlflow():
+    # Use packaged model during deployment
+    model_path_env = os.getenv("MODEL_PATH")
+
+    if model_path_env:
+        bundled_model_path = Path(model_path_env)
+    else:
+        bundled_model_path = PROJECT_ROOT / "models" / "best.pt"
+
+    if bundled_model_path.exists():
+        print("\nUsing packaged YOLO model:")
+        print(bundled_model_path)
+        return bundled_model_path
 
     tracking_uri = os.getenv(
         "MLFLOW_TRACKING_URI",
@@ -57,10 +70,7 @@ def get_model_path_from_mlflow():
 
     client = MlflowClient()
 
-    # --------------------------------------------------------
     # Find model version using champion alias
-    # --------------------------------------------------------
-
     model_version = client.get_model_version_by_alias(
         MODEL_NAME,
         MODEL_ALIAS
@@ -74,24 +84,16 @@ def get_model_path_from_mlflow():
 
     run_id = model_version.run_id
 
-    # --------------------------------------------------------
     # Get artifact information
-    # --------------------------------------------------------
-
     run = client.get_run(run_id)
 
     print("\nActual artifact URI:")
     print(run.info.artifact_uri)
 
-    # --------------------------------------------------------
-    # Ask MLflow for the actual artifact file
-    # instead of manually constructing a Windows file path
-    # --------------------------------------------------------
-
+    # Download the trained model artifact
     print("\nLooking for model artifact...")
 
     try:
-
         model_path = client.download_artifacts(
             run_id,
             "model/best.pt"
@@ -99,12 +101,10 @@ def get_model_path_from_mlflow():
 
     except Exception as e:
 
-        print("\nCould not download/find model artifact.")
-
+        print("\nCould not find model/best.pt.")
         print("\nTrying to list available artifacts...")
 
         try:
-
             artifacts = client.list_artifacts(run_id)
 
             for artifact in artifacts:
@@ -113,26 +113,16 @@ def get_model_path_from_mlflow():
 
                 if artifact.is_dir:
 
-                    try:
+                    sub_artifacts = client.list_artifacts(
+                        run_id,
+                        artifact.path
+                    )
 
-                        sub_artifacts = client.list_artifacts(
-                            run_id,
-                            artifact.path
-                        )
-
-                        for sub_artifact in sub_artifacts:
-                            print(
-                                f"    {sub_artifact.path}"
-                            )
-
-                    except Exception:
-                        pass
+                    for sub_artifact in sub_artifacts:
+                        print(f"    {sub_artifact.path}")
 
         except Exception as list_error:
-
-            print(
-                f"Could not list artifacts: {list_error}"
-            )
+            print(f"Could not list artifacts: {list_error}")
 
         raise FileNotFoundError(
             "Could not find model/best.pt in MLflow.\n"
@@ -145,11 +135,8 @@ def get_model_path_from_mlflow():
     print(model_path)
 
     if not model_path.exists():
-
         raise FileNotFoundError(
-            "MLflow returned a model path, "
-            "but the file does not exist:\n"
-            f"{model_path}"
+            f"Model file does not exist: {model_path}"
         )
 
     print("\nMODEL FILE FOUND")
@@ -183,10 +170,7 @@ def load_model():
         print("\nClasses:")
 
         for class_id, class_name in model.names.items():
-
-            print(
-                f"  {class_id}: {class_name}"
-            )
+            print(f"  {class_id}: {class_name}")
 
         print("\n" + "=" * 60)
         print("MODEL LOADING COMPLETE")
@@ -206,7 +190,6 @@ def load_model():
 
 @app.on_event("startup")
 def startup_event():
-
     load_model()
 
 
@@ -256,11 +239,16 @@ def health():
 
 @app.post("/predict")
 async def predict(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    conf: float = Query(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description="Confidence threshold between 0 and 1"
+    )
 ):
 
     if model is None:
-
         raise HTTPException(
             status_code=503,
             detail="Model is not loaded."
@@ -274,7 +262,6 @@ async def predict(
     }
 
     if file.content_type not in allowed_types:
-
         raise HTTPException(
             status_code=400,
             detail="Invalid image format. Use JPG, PNG, or WEBP."
@@ -283,41 +270,31 @@ async def predict(
     image_bytes = await file.read()
 
     if not image_bytes:
-
         raise HTTPException(
             status_code=400,
             detail="Uploaded image is empty."
         )
 
-    suffix = Path(
-        file.filename or ".jpg"
-    ).suffix
+    suffix = Path(file.filename or "image.jpg").suffix or ".jpg"
 
     temp_path = None
 
     try:
 
-        # ----------------------------------------------------
         # Create temporary image
-        # ----------------------------------------------------
-
         with tempfile.NamedTemporaryFile(
             delete=False,
             suffix=suffix
         ) as temp_file:
 
             temp_file.write(image_bytes)
-
             temp_path = temp_file.name
 
-        # ----------------------------------------------------
         # YOLO prediction
-        # ----------------------------------------------------
-
         results = model.predict(
             source=temp_path,
             imgsz=640,
-            conf=0.25,
+            conf=conf,
             device="cpu",
             verbose=False
         )
@@ -326,21 +303,14 @@ async def predict(
 
         detections = []
 
-        # ----------------------------------------------------
         # Process detections
-        # ----------------------------------------------------
-
         if result.boxes is not None:
 
             for box in result.boxes:
 
-                class_id = int(
-                    box.cls[0].item()
-                )
+                class_id = int(box.cls[0].item())
 
-                confidence = float(
-                    box.conf[0].item()
-                )
+                confidence = float(box.conf[0].item())
 
                 coordinates = (
                     box.xyxy[0]
@@ -348,79 +318,41 @@ async def predict(
                     .tolist()
                 )
 
-                detections.append(
-                    {
-                        "class_id": class_id,
+                detections.append({
 
-                        "class_name": model.names[
-                            class_id
-                        ],
+                    "class_id": class_id,
 
-                        "confidence": round(
-                            confidence,
-                            4
-                        ),
+                    "class_name": model.names[class_id],
 
-                        "bounding_box": {
+                    "confidence": round(confidence, 4),
 
-                            "x1": round(
-                                coordinates[0],
-                                2
-                            ),
-
-                            "y1": round(
-                                coordinates[1],
-                                2
-                            ),
-
-                            "x2": round(
-                                coordinates[2],
-                                2
-                            ),
-
-                            "y2": round(
-                                coordinates[3],
-                                2
-                            ),
-                        }
+                    "bounding_box": {
+                        "x1": round(coordinates[0], 2),
+                        "y1": round(coordinates[1], 2),
+                        "x2": round(coordinates[2], 2),
+                        "y2": round(coordinates[3], 2),
                     }
-                )
+                })
 
-        # ----------------------------------------------------
         # Return prediction
-        # ----------------------------------------------------
-
         return {
-
             "success": True,
-
             "model": MODEL_NAME,
-
             "model_alias": MODEL_ALIAS,
-
             "filename": file.filename,
-
-            "detection_count": len(
-                detections
-            ),
-
+            "confidence_threshold": conf,
+            "detection_count": len(detections),
             "detections": detections,
         }
 
     finally:
 
-        # ----------------------------------------------------
         # Delete temporary image
-        # ----------------------------------------------------
-
         if temp_path:
 
-            temp_file_path = Path(
-                temp_path
-            )
+            temp_file_path = Path(temp_path)
 
             if temp_file_path.exists():
-
                 temp_file_path.unlink()
 
 
@@ -434,7 +366,7 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "app.main:app",
-        host="127.0.0.1",
-        port=8000,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
         reload=False
     )
