@@ -1,604 +1,404 @@
+
 import io
-import cv2
-import numpy as np
-import os
+import tempfile
+from pathlib import Path
+
+import av
 import requests
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+
+from video_utils import load_detection_model, process_video
 
 
-# ============================================================
+# --------------------------------------------------
 # CONFIGURATION
-# ============================================================
+# --------------------------------------------------
 
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
-
-
-# ============================================================
-# PAGE CONFIGURATION
-# ============================================================
+API_URL = "http://127.0.0.1:8000"
 
 st.set_page_config(
-    page_title="MaskGuard AI",
-    page_icon="🛡️",
+    page_title="Face Mask Detection MLOps",
+    page_icon="😷",
     layout="wide",
-    initial_sidebar_state="expanded",
+)
+
+st.title("😷 Face Mask Detection MLOps")
+st.write(
+    "Detect mask, bad mask, and no mask using your trained YOLOv8 model."
 )
 
 
-# ============================================================
-# CUSTOM CSS
-# ============================================================
+# --------------------------------------------------
+# LOAD MODEL
+# --------------------------------------------------
 
-st.markdown(
-    """
-    <style>
-
-    .main {
-        background-color: #F8FAFC;
-    }
-
-    .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-    }
-
-    .title {
-        font-size: 42px;
-        font-weight: 700;
-        color: #0F172A;
-        margin-bottom: 5px;
-    }
-
-    .subtitle {
-        font-size: 18px;
-        color: #64748B;
-        margin-bottom: 25px;
-    }
-
-    .metric-card {
-        background-color: white;
-        padding: 20px;
-        border-radius: 14px;
-        border: 1px solid #E2E8F0;
-        text-align: center;
-        min-height: 120px;
-    }
-
-    .metric-title {
-        font-size: 15px;
-        color: #64748B;
-    }
-
-    .metric-value {
-        font-size: 30px;
-        font-weight: 700;
-        color: #0F4C81;
-        margin-top: 8px;
-    }
-
-    .result-card {
-        padding: 20px;
-        border-radius: 14px;
-        margin-top: 15px;
-        background-color: white;
-        border: 1px solid #E2E8F0;
-    }
-
-    .footer {
-        text-align: center;
-        color: #64748B;
-        margin-top: 40px;
-        padding: 20px;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+@st.cache_resource
+def get_model():
+    return load_detection_model()
 
 
-# ============================================================
-# HEADER
-# ============================================================
+# --------------------------------------------------
+# DISPLAY DETECTION COUNTS
+# --------------------------------------------------
 
-st.markdown(
-    '<div class="title">🛡️ MaskGuard AI</div>',
-    unsafe_allow_html=True,
-)
+def show_detection_counts(counts, total=None):
+    col1, col2, col3, col4 = st.columns(4)
 
-st.markdown(
-    '<div class="subtitle">'
-    'Real-Time Face Mask Detection powered by YOLOv8, '
-    'FastAPI and MLflow'
-    '</div>',
-    unsafe_allow_html=True,
-)
+    mask_count = counts.get("mask", 0)
+    no_mask_count = counts.get("no mask", 0)
+    bad_mask_count = counts.get("bad mask", 0)
 
+    col1.metric("Mask", mask_count)
+    col2.metric("No Mask", no_mask_count)
+    col3.metric("Bad Mask", bad_mask_count)
 
-# ============================================================
-# SIDEBAR
-# ============================================================
+    if total is None:
+        total = mask_count + no_mask_count + bad_mask_count
 
-with st.sidebar:
-
-    st.header("⚙️ System")
-
-    st.write("**Model:** Face_Mask_Detector")
-    st.write("**Version:** champion")
-    st.write("**Framework:** YOLOv8")
-    st.write("**Backend:** FastAPI")
-    st.write("**Tracking:** MLflow")
-
-    st.divider()
-
-    st.subheader("API Status")
-
-    try:
-
-        health_response = requests.get(
-            f"{API_URL}/health",
-            timeout=5
-        )
-
-        if health_response.status_code == 200:
-
-            health_data = health_response.json()
-
-            if health_data.get("model_loaded"):
-
-                st.success("🟢 API Online")
-                st.success("🟢 Model Loaded")
-
-            else:
-
-                st.warning("🟡 API Online")
-                st.error("🔴 Model Not Loaded")
-
-        else:
-
-            st.error("🔴 API Error")
-
-    except requests.RequestException:
-
-        st.error("🔴 API Offline")
-
-        st.caption(
-            "Start FastAPI on port 8000."
-        )
+    col4.metric("Total Detections", total)
 
 
-# ============================================================
-# IMAGE UPLOAD
-# ============================================================
+# --------------------------------------------------
+# IMAGE PREDICTION
+# --------------------------------------------------
 
-st.subheader("📷 Upload an Image")
+def image_page():
+    st.header("Image Detection")
 
-uploaded_file = st.file_uploader(
-    "Choose a face image",
-    type=["jpg", "jpeg", "png", "webp"],
-    help="Upload an image containing one or more people."
-)
+    uploaded = st.file_uploader(
+        "Upload an image",
+        type=["jpg", "jpeg", "png", "webp"],
+        key="image_upload",
+    )
 
+    confidence = st.slider(
+        "Confidence threshold",
+        min_value=0.10,
+        max_value=0.90,
+        value=0.25,
+        step=0.05,
+        key="image_confidence",
+    )
 
-# ============================================================
-# PROCESS IMAGE
-# ============================================================
-
-if uploaded_file is not None:
-
-    # --------------------------------------------------------
-    # Read uploaded image
-    # --------------------------------------------------------
-
-    image_bytes = uploaded_file.getvalue()
-
-    original_image = Image.open(
-        io.BytesIO(image_bytes)
-    ).convert("RGB")
-
-    # --------------------------------------------------------
-    # Display original image
-    # --------------------------------------------------------
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        st.markdown("### Original Image")
-
-        st.image(
-            original_image,
-            use_container_width=True
-        )
-
-    # --------------------------------------------------------
-    # Detect button
-    # --------------------------------------------------------
-
-    if st.button(
-        "🔍 Detect Face Masks",
-        type="primary",
-        use_container_width=True
-    ):
-
-        with st.spinner(
-            "Running YOLOv8 detection..."
-        ):
-
-            try:
-
+    if uploaded and st.button("Detect Masks", key="image_detect"):
+        try:
+            with st.spinner("Detecting masks..."):
                 response = requests.post(
                     f"{API_URL}/predict",
                     files={
                         "file": (
-                            uploaded_file.name,
-                            image_bytes,
-                            uploaded_file.type
+                            uploaded.name,
+                            uploaded.getvalue(),
+                            uploaded.type or "image/jpeg",
                         )
                     },
-                    timeout=60
+                    params={"conf": confidence},
+                    timeout=180,
                 )
 
-                # ------------------------------------------------
-                # Handle API errors
-                # ------------------------------------------------
-
-                if response.status_code != 200:
-
+                if not response.ok:
                     st.error(
-                        f"API Error: "
-                        f"{response.status_code}"
+                        f"API error ({response.status_code}): "
+                        f"{response.text}"
+                    )
+                    return
+
+                result = response.json()
+                detections = result.get("detections", [])
+
+                image = Image.open(
+                    io.BytesIO(uploaded.getvalue())
+                ).convert("RGB")
+
+                draw = ImageDraw.Draw(image)
+
+                colors = {
+                    "mask": "#16A34A",
+                    "no mask": "#DC2626",
+                    "bad mask": "#F59E0B",
+                }
+
+                counts = {
+                    "mask": 0,
+                    "no mask": 0,
+                    "bad mask": 0,
+                }
+
+                rows = []
+
+                for detection in detections:
+                    name = detection.get("class_name", "unknown")
+                    score = float(detection.get("confidence", 0))
+                    box = detection.get("bounding_box", {})
+
+                    if name in counts:
+                        counts[name] += 1
+
+                    x1 = int(box.get("x1", 0))
+                    y1 = int(box.get("y1", 0))
+                    x2 = int(box.get("x2", 0))
+                    y2 = int(box.get("y2", 0))
+
+                    color = colors.get(name, "#2563EB")
+
+                    x1 = max(0, min(x1, image.width - 1))
+                    x2 = max(0, min(x2, image.width - 1))
+                    y1 = max(0, min(y1, image.height - 1))
+                    y2 = max(0, min(y2, image.height - 1))
+
+                    draw.rectangle(
+                        [x1, y1, x2, y2],
+                        outline=color,
+                        width=4,
                     )
 
-                    st.code(
-                        response.text
+                    label = f"{name}: {score:.0%}"
+                    text_box = draw.textbbox((x1, y1), label)
+
+                    text_width = text_box[2] - text_box[0]
+                    text_height = text_box[3] - text_box[1]
+                    label_y = max(0, y1 - text_height - 8)
+
+                    draw.rectangle(
+                        [
+                            x1,
+                            label_y,
+                            min(image.width - 1, x1 + text_width + 8),
+                            min(
+                                image.height - 1,
+                                label_y + text_height + 8,
+                            ),
+                        ],
+                        fill=color,
                     )
 
-                    st.stop()
-
-                data = response.json()
-
-                # ------------------------------------------------
-                # OpenCV image for bounding boxes
-                # ------------------------------------------------
-
-                image_array = np.array(
-                    original_image
-                )
-
-                image_cv = cv2.cvtColor(
-                    image_array,
-                    cv2.COLOR_RGB2BGR
-                )
-
-                # ------------------------------------------------
-                # Detection counters
-                # ------------------------------------------------
-
-                mask_count = 0
-                no_mask_count = 0
-                bad_mask_count = 0
-
-                # ------------------------------------------------
-                # Draw detections
-                # ------------------------------------------------
-
-                for detection in data.get(
-                    "detections",
-                    []
-                ):
-
-                    class_name = detection[
-                        "class_name"
-                    ]
-
-                    confidence = detection[
-                        "confidence"
-                    ]
-
-                    box = detection[
-                        "bounding_box"
-                    ]
-
-                    x1 = int(box["x1"])
-                    y1 = int(box["y1"])
-                    x2 = int(box["x2"])
-                    y2 = int(box["y2"])
-
-                    # --------------------------------------------
-                    # Count classes
-                    # --------------------------------------------
-
-                    if class_name == "mask":
-
-                        mask_count += 1
-
-                    elif class_name == "no mask":
-
-                        no_mask_count += 1
-
-                    elif class_name == "bad mask":
-
-                        bad_mask_count += 1
-
-                    # --------------------------------------------
-                    # Draw bounding box
-                    # --------------------------------------------
-
-                    cv2.rectangle(
-                        image_cv,
-                        (x1, y1),
-                        (x2, y2),
-                        (255, 0, 0),
-                        3
-                    )
-
-                    label = (
-                        f"{class_name} "
-                        f"{confidence * 100:.1f}%"
-                    )
-
-                    # --------------------------------------------
-                    # Label background
-                    # --------------------------------------------
-
-                    (text_width, text_height), _ = (
-                        cv2.getTextSize(
-                            label,
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            2
-                        )
-                    )
-
-                    cv2.rectangle(
-                        image_cv,
-                        (x1, max(
-                            0,
-                            y1 - text_height - 12
-                        )),
-                        (
-                            x1 + text_width + 8,
-                            y1
-                        ),
-                        (255, 0, 0),
-                        -1
-                    )
-
-                    cv2.putText(
-                        image_cv,
+                    draw.text(
+                        (x1 + 4, label_y + 4),
                         label,
-                        (
-                            x1 + 4,
-                            max(
-                                text_height + 2,
-                                y1 - 6
-                            )
-                        ),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
-                        2
+                        fill="white",
                     )
 
-                # ------------------------------------------------
-                # Convert back to RGB
-                # ------------------------------------------------
+                    rows.append({
+                        "Class": name,
+                        "Confidence": f"{score:.1%}",
+                    })
 
-                annotated_image = cv2.cvtColor(
-                    image_cv,
-                    cv2.COLOR_BGR2RGB
+            st.success("Prediction completed!")
+
+            show_detection_counts(
+                counts,
+                result.get("detection_count", len(detections)),
+            )
+
+            original_col, result_col = st.columns(2)
+
+            with original_col:
+                st.subheader("Original Image")
+                st.image(
+                    uploaded.getvalue(),
+                    use_container_width=True,
                 )
 
-                # ------------------------------------------------
-                # Display result
-                # ------------------------------------------------
-
-                with col2:
-
-                    st.markdown(
-                        "### Detection Result"
-                    )
-
-                    st.image(
-                        annotated_image,
-                        use_container_width=True
-                    )
-
-                # ------------------------------------------------
-                # Metrics
-                # ------------------------------------------------
-
-                st.markdown("### 📊 Detection Summary")
-
-                m1, m2, m3, m4 = st.columns(4)
-
-                with m1:
-
-                    st.markdown(
-                        f"""
-                        <div class="metric-card">
-                            <div class="metric-title">
-                                Total Detections
-                            </div>
-                            <div class="metric-value">
-                                {data.get("detection_count", 0)}
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-
-                with m2:
-
-                    st.markdown(
-                        f"""
-                        <div class="metric-card">
-                            <div class="metric-title">
-                                😷 Mask
-                            </div>
-                            <div class="metric-value">
-                                {mask_count}
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-
-                with m3:
-
-                    st.markdown(
-                        f"""
-                        <div class="metric-card">
-                            <div class="metric-title">
-                                🚫 No Mask
-                            </div>
-                            <div class="metric-value">
-                                {no_mask_count}
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-
-                with m4:
-
-                    st.markdown(
-                        f"""
-                        <div class="metric-card">
-                            <div class="metric-title">
-                                ⚠️ Bad Mask
-                            </div>
-                            <div class="metric-value">
-                                {bad_mask_count}
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-
-                # ------------------------------------------------
-                # Detection Details
-                # ------------------------------------------------
-
-                st.markdown(
-                    "### 🔎 Detection Details"
+            with result_col:
+                st.subheader("Detected Image")
+                st.image(
+                    image,
+                    use_container_width=True,
                 )
 
-                detections = data.get(
-                    "detections",
-                    []
+                output_buffer = io.BytesIO()
+                image.save(output_buffer, format="PNG")
+
+                st.download_button(
+                    "Download Detected Image",
+                    data=output_buffer.getvalue(),
+                    file_name="face_mask_detection.png",
+                    mime="image/png",
                 )
 
-                if detections:
+            st.subheader("Detection Details")
 
-                    for index, detection in enumerate(
-                        detections,
-                        start=1
-                    ):
+            if rows:
+                st.dataframe(
+                    rows,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info("No objects were detected.")
 
-                        class_name = detection[
-                            "class_name"
-                        ]
+        except requests.RequestException:
+            st.error(
+                "Cannot connect to FastAPI. "
+                "Make sure the API is running on port 8000."
+            )
 
-                        confidence = detection[
-                            "confidence"
-                        ]
+        except Exception as error:
+            st.error(f"Image prediction failed: {error}")
 
-                        if class_name == "mask":
 
-                            st.success(
-                                f"Detection {index}: "
-                                f"😷 {class_name.upper()} — "
-                                f"{confidence * 100:.2f}%"
-                            )
+# --------------------------------------------------
+# VIDEO UPLOAD
+# --------------------------------------------------
 
-                        elif class_name == "no mask":
+def video_page():
+    st.header("Video Detection")
 
-                            st.error(
-                                f"Detection {index}: "
-                                f"🚫 {class_name.upper()} — "
-                                f"{confidence * 100:.2f}%"
-                            )
+    uploaded = st.file_uploader(
+        "Upload a video",
+        type=["mp4", "avi", "mov", "mkv"],
+        key="video_upload",
+    )
 
-                        else:
+    confidence = st.slider(
+        "Confidence threshold",
+        min_value=0.10,
+        max_value=0.90,
+        value=0.25,
+        step=0.05,
+        key="video_confidence",
+    )
 
-                            st.warning(
-                                f"Detection {index}: "
-                                f"⚠️ {class_name.upper()} — "
-                                f"{confidence * 100:.2f}%"
-                            )
+    if uploaded:
+        st.subheader("Original Video")
+        st.video(uploaded.getvalue())
 
-                else:
+        if st.button("Process Video", key="process_video"):
+            input_path = None
+            output_path = None
 
-                    st.info(
-                        "No faces detected."
+            try:
+                with tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix=Path(uploaded.name).suffix or ".mp4",
+                ) as temp:
+                    temp.write(uploaded.getvalue())
+                    input_path = temp.name
+
+                with st.spinner(
+                    "Processing video on CPU. "
+                    "Long videos may take some time..."
+                ):
+                    model = get_model()
+
+                    (
+                        output_path,
+                        counts,
+                        processed,
+                        total,
+                    ) = process_video(
+                        input_path,
+                        model,
+                        confidence=confidence,
                     )
 
-                # ------------------------------------------------
-                # Model information
-                # ------------------------------------------------
+                st.success("Video processing completed!")
 
-                st.markdown(
-                    "### 🤖 Model Information"
+                st.write(
+                    f"**Frames processed:** {processed} / {total}"
                 )
 
-                info1, info2, info3 = st.columns(3)
+                st.subheader("Detection Summary")
+                show_detection_counts(counts)
 
-                with info1:
-
-                    st.info(
-                        f"Model\n\n"
-                        f"{data.get('model', 'Unknown')}"
-                    )
-
-                with info2:
-
-                    st.info(
-                        f"Alias\n\n"
-                        f"{data.get('model_alias', 'Unknown')}"
-                    )
-
-                with info3:
-
-                    st.info(
-                        f"Detections\n\n"
-                        f"{data.get('detection_count', 0)}"
-                    )
-
-            except requests.RequestException as e:
-
-                st.error(
-                    "Could not connect to FastAPI."
+                st.caption(
+                    "Counts include detections across all processed frames. "
+                    "The same person may be counted in multiple frames."
                 )
 
-                st.code(
-                    str(e)
+                st.subheader("Annotated Video")
+                st.video(output_path)
+
+                with open(output_path, "rb") as file:
+                    video_bytes = file.read()
+
+                st.download_button(
+                    "Download Annotated Video",
+                    data=video_bytes,
+                    file_name="face_mask_detection.mp4",
+                    mime="video/mp4",
                 )
 
-            except Exception as e:
+            except Exception as error:
+                st.error(f"Video processing failed: {error}")
 
-                st.error(
-                    "Unexpected error occurred."
-                )
-
-                st.code(
-                    str(e)
-                )
+            finally:
+                if input_path:
+                    Path(input_path).unlink(missing_ok=True)
 
 
-# ============================================================
-# FOOTER
-# ============================================================
+# --------------------------------------------------
+# LIVE WEBCAM
+# --------------------------------------------------
 
-st.markdown(
-    """
-    <div class="footer">
-        🛡️ <b>MaskGuard AI</b><br>
-        Face Mask Detection with MLOps<br>
-        YOLOv8 • FastAPI • MLflow • Streamlit
-    </div>
-    """,
-    unsafe_allow_html=True
+class MaskVideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.model = get_model()
+
+    def recv(self, frame):
+        image = frame.to_ndarray(format="bgr24")
+
+        result = self.model.predict(
+            source=image,
+            imgsz=640,
+            conf=0.25,
+            device="cpu",
+            verbose=False,
+        )[0]
+
+        annotated = result.plot()
+
+        return av.VideoFrame.from_ndarray(
+            annotated,
+            format="bgr24",
+        )
+
+
+def webcam_page():
+    st.header("Live Webcam Detection")
+
+    st.info(
+        "Allow camera access in your browser. "
+        "Click START to begin and STOP to finish."
+    )
+
+    webrtc_streamer(
+        key="face-mask-webcam",
+        video_processor_factory=MaskVideoProcessor,
+        media_stream_constraints={
+            "video": True,
+            "audio": False,
+        },
+        async_processing=True,
+    )
+
+
+# --------------------------------------------------
+# APPLICATION NAVIGATION
+# Keep this section at the bottom
+# --------------------------------------------------
+
+image_tab, video_tab, webcam_tab = st.tabs(
+    [
+        "🖼️ Image Detection",
+        "🎥 Video Upload",
+        "📷 Live Webcam",
+    ]
+)
+
+with image_tab:
+    image_page()
+
+with video_tab:
+    video_page()
+
+with webcam_tab:
+    webcam_page()
+
+st.divider()
+
+st.caption(
+    "Face Mask Detection | YOLOv8 + MLflow + FastAPI + Streamlit"
 )

@@ -1,6 +1,5 @@
 from pathlib import Path
 import os
-import re
 import tempfile
 
 import mlflow
@@ -11,34 +10,36 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 
 
+# ============================================================
+# PROJECT CONFIGURATION
+# ============================================================
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MLFLOW_DB = PROJECT_ROOT / "mlflow.db"
+
+MLFLOW_DB = PROJECT_ROOT / "mlflow_test_restore.db"
 
 MODEL_NAME = "Face_Mask_Detector"
 MODEL_ALIAS = "champion"
 
-# Model artifact inside the Docker container
-DOCKER_MLRUNS_ROOT = Path("/mlruns")
 
+# ============================================================
+# FASTAPI APPLICATION
+# ============================================================
 
 app = FastAPI(
     title="Face Mask Detection API",
-    description=(
-        "Real-time face mask detection API "
-        "using YOLOv8 and MLflow."
-    ),
+    description="Real-time face mask detection API using YOLOv8 and MLflow.",
     version="1.0.0",
 )
 
 model = None
 
 
+# ============================================================
+# GET MODEL FROM MLFLOW
+# ============================================================
+
 def get_model_path_from_mlflow():
-    """
-    Resolve the champion model from MLflow Model Registry,
-    then convert its Windows artifact path into the
-    Docker-mounted /mlruns path.
-    """
 
     tracking_uri = os.getenv(
         "MLFLOW_TRACKING_URI",
@@ -56,7 +57,10 @@ def get_model_path_from_mlflow():
 
     client = MlflowClient()
 
-    # Resolve champion alias
+    # --------------------------------------------------------
+    # Find model version using champion alias
+    # --------------------------------------------------------
+
     model_version = client.get_model_version_by_alias(
         MODEL_NAME,
         MODEL_ALIAS
@@ -68,41 +72,97 @@ def get_model_path_from_mlflow():
     print(f"  Run ID: {model_version.run_id}")
     print(f"  Source: {model_version.source}")
 
-    artifact_uri = model_version.source
-
-    print("\nOriginal artifact URI:")
-    print(artifact_uri)
-
-    # Example source:
-    # runs:/<run_id>/model
-    #
-    # Convert it to the actual MLflow artifact directory
-    # inside the Docker-mounted /mlruns directory.
-
     run_id = model_version.run_id
 
-    model_artifact_path = (
-        DOCKER_MLRUNS_ROOT
-        / "1"
-        / run_id
-        / "artifacts"
-        / "model"
-        / "best.pt"
-    )
+    # --------------------------------------------------------
+    # Get artifact information
+    # --------------------------------------------------------
 
-    print("\nDocker model path:")
-    print(model_artifact_path)
+    run = client.get_run(run_id)
 
-    if not model_artifact_path.exists():
-        raise FileNotFoundError(
-            "Model file was not found inside Docker:\n"
-            f"{model_artifact_path}"
+    print("\nActual artifact URI:")
+    print(run.info.artifact_uri)
+
+    # --------------------------------------------------------
+    # Ask MLflow for the actual artifact file
+    # instead of manually constructing a Windows file path
+    # --------------------------------------------------------
+
+    print("\nLooking for model artifact...")
+
+    try:
+
+        model_path = client.download_artifacts(
+            run_id,
+            "model/best.pt"
         )
 
-    return model_artifact_path
+    except Exception as e:
 
+        print("\nCould not download/find model artifact.")
+
+        print("\nTrying to list available artifacts...")
+
+        try:
+
+            artifacts = client.list_artifacts(run_id)
+
+            for artifact in artifacts:
+
+                print(f"  {artifact.path}")
+
+                if artifact.is_dir:
+
+                    try:
+
+                        sub_artifacts = client.list_artifacts(
+                            run_id,
+                            artifact.path
+                        )
+
+                        for sub_artifact in sub_artifacts:
+                            print(
+                                f"    {sub_artifact.path}"
+                            )
+
+                    except Exception:
+                        pass
+
+        except Exception as list_error:
+
+            print(
+                f"Could not list artifacts: {list_error}"
+            )
+
+        raise FileNotFoundError(
+            "Could not find model/best.pt in MLflow.\n"
+            f"Original error: {e}"
+        )
+
+    model_path = Path(model_path)
+
+    print("\nDownloaded/local model path:")
+    print(model_path)
+
+    if not model_path.exists():
+
+        raise FileNotFoundError(
+            "MLflow returned a model path, "
+            "but the file does not exist:\n"
+            f"{model_path}"
+        )
+
+    print("\nMODEL FILE FOUND")
+
+    return model_path
+
+
+# ============================================================
+# LOAD MODEL
+# ============================================================
 
 def load_model():
+
     global model
 
     print("=" * 60)
@@ -110,6 +170,7 @@ def load_model():
     print("=" * 60)
 
     try:
+
         model_path = get_model_path_from_mlflow()
 
         print("\nLoading YOLO model...")
@@ -117,29 +178,45 @@ def load_model():
 
         model = YOLO(str(model_path))
 
-        print("\n✅ YOLO model loaded successfully")
+        print("\nYOLO model loaded successfully")
 
         print("\nClasses:")
+
         for class_id, class_name in model.names.items():
-            print(f"  {class_id}: {class_name}")
+
+            print(
+                f"  {class_id}: {class_name}"
+            )
 
         print("\n" + "=" * 60)
         print("MODEL LOADING COMPLETE")
         print("=" * 60)
 
     except Exception as e:
-        print("\n❌ MODEL LOADING FAILED")
+
+        print("\nMODEL LOADING FAILED")
         print(str(e))
+
         raise
 
 
+# ============================================================
+# STARTUP EVENT
+# ============================================================
+
 @app.on_event("startup")
 def startup_event():
+
     load_model()
 
 
+# ============================================================
+# ROOT ENDPOINT
+# ============================================================
+
 @app.get("/")
 def root():
+
     return {
         "message": "Face Mask Detection API",
         "status": "running",
@@ -148,9 +225,15 @@ def root():
     }
 
 
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
 @app.get("/health")
 def health():
+
     if model is None:
+
         return JSONResponse(
             status_code=503,
             content={
@@ -167,10 +250,17 @@ def health():
     }
 
 
+# ============================================================
+# PREDICTION ENDPOINT
+# ============================================================
+
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(
+    file: UploadFile = File(...)
+):
 
     if model is None:
+
         raise HTTPException(
             status_code=503,
             detail="Model is not loaded."
@@ -184,34 +274,45 @@ async def predict(file: UploadFile = File(...)):
     }
 
     if file.content_type not in allowed_types:
+
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Invalid image format. "
-                "Use JPG, PNG, or WEBP."
-            )
+            detail="Invalid image format. Use JPG, PNG, or WEBP."
         )
 
     image_bytes = await file.read()
 
     if not image_bytes:
+
         raise HTTPException(
             status_code=400,
             detail="Uploaded image is empty."
         )
 
-    suffix = Path(file.filename or ".jpg").suffix
+    suffix = Path(
+        file.filename or ".jpg"
+    ).suffix
 
     temp_path = None
 
     try:
+
+        # ----------------------------------------------------
+        # Create temporary image
+        # ----------------------------------------------------
+
         with tempfile.NamedTemporaryFile(
             delete=False,
             suffix=suffix
         ) as temp_file:
 
             temp_file.write(image_bytes)
+
             temp_path = temp_file.name
+
+        # ----------------------------------------------------
+        # YOLO prediction
+        # ----------------------------------------------------
 
         results = model.predict(
             source=temp_path,
@@ -224,6 +325,10 @@ async def predict(file: UploadFile = File(...)):
         result = results[0]
 
         detections = []
+
+        # ----------------------------------------------------
+        # Process detections
+        # ----------------------------------------------------
 
         if result.boxes is not None:
 
@@ -246,24 +351,33 @@ async def predict(file: UploadFile = File(...)):
                 detections.append(
                     {
                         "class_id": class_id,
-                        "class_name": model.names[class_id],
+
+                        "class_name": model.names[
+                            class_id
+                        ],
+
                         "confidence": round(
                             confidence,
                             4
                         ),
+
                         "bounding_box": {
+
                             "x1": round(
                                 coordinates[0],
                                 2
                             ),
+
                             "y1": round(
                                 coordinates[1],
                                 2
                             ),
+
                             "x2": round(
                                 coordinates[2],
                                 2
                             ),
+
                             "y2": round(
                                 coordinates[3],
                                 2
@@ -272,24 +386,47 @@ async def predict(file: UploadFile = File(...)):
                     }
                 )
 
+        # ----------------------------------------------------
+        # Return prediction
+        # ----------------------------------------------------
+
         return {
+
             "success": True,
+
             "model": MODEL_NAME,
+
             "model_alias": MODEL_ALIAS,
+
             "filename": file.filename,
-            "detection_count": len(detections),
+
+            "detection_count": len(
+                detections
+            ),
+
             "detections": detections,
         }
 
     finally:
 
+        # ----------------------------------------------------
+        # Delete temporary image
+        # ----------------------------------------------------
+
         if temp_path:
 
-            temp_file_path = Path(temp_path)
+            temp_file_path = Path(
+                temp_path
+            )
 
             if temp_file_path.exists():
+
                 temp_file_path.unlink()
 
+
+# ============================================================
+# RUN APPLICATION DIRECTLY
+# ============================================================
 
 if __name__ == "__main__":
 
